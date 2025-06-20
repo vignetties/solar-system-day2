@@ -1,10 +1,10 @@
 name: solar system 
 on: 
   workflow_dispatch:
-  push: 
-    branches: 
-      - main
-      - feature/*
+  # push: 
+  #   branches: 
+  #     - main
+  #     - feature/*
 
 env: 
   MONGO_URI: 'mongodb+srv://supercluster.d83jj.mongodb.net/superData'
@@ -221,10 +221,10 @@ jobs:
     if:  github.ref ==  'refs/heads/main'
     needs: docker
     outputs: 
-      PORTA: ${{ steps.myservice.outputs.PORT}}
+      PORTA: ${{ steps.myservice.outputs.PORTA }}
     environment: 
       name: production 
-      url: http://3.136.148.224:${{ steps.myservice.outputs.PORT}}
+      url: http://3.136.148.224:${{ steps.myservice.outputs.PORTA}}
     runs-on: ubuntu-latest
     steps: 
       - name: checkout repo 
