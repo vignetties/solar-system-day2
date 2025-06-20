@@ -1,0 +1,292 @@
+name: solar system 
+on: 
+  workflow_dispatch:
+  push: 
+    branches: 
+      - main
+      - feature/*
+
+env: 
+  MONGO_URI: 'mongodb+srv://supercluster.d83jj.mongodb.net/superData'
+  MONGO_USERNAME: ${{ vars.MONGO_USERNAME }}
+  MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+
+jobs: 
+  unit-testing: 
+    strategy: 
+      matrix:
+        nodejsversion: [18,]
+        os: [ubuntu-latest ]
+        # exclude: 
+        #   - nodejsversion: 18
+        #     os: macos-latest
+
+    name: unit-testing
+    services: 
+      mongo-db: 
+        image: mdhack/mongo-db:non-prod
+        ports: 
+          - 27017:27017
+    env: 
+      MONGO_URI: 'mongodb://localhost:27017/superData'
+      MONGO_USERNAME:  non-prod-user
+      MONGO_PASSWORD:  non-prod-password
+    #name: nodejs unit testing
+    runs-on: ${{ matrix.os }}
+    steps: 
+      - name: checkout repo 
+        uses: actions/checkout@v4
+      - uses: actions/setup-node@v4 
+        with:
+          node-version: ${{ matrix.nodejsversion }}
+
+      - name: Saving Cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+
+
+      - name: install dependencies
+        run: npm install 
+         
+      - name: testing npm 
+        run: npm test
+         
+      - name: Saving the test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: 
+          name: numberwise-${{ matrix.nodejsversion }}-onn-${{ matrix.os }}
+          path: test-results.xml
+
+
+  code-coverage: 
+    name: job container
+    container: 
+      image: node:18
+    services: 
+      mongo-db: 
+        image: mdhack/mongo-db:non-prod
+
+
+    env: 
+       MONGO_URI: 'mongodb://localhost:27017/superData'
+       MONGO_USERNAME:  non-prod-username
+       MONGO_PASSWORD:  non-prod-password
+
+    runs-on: ubuntu-latest
+    steps: 
+      - name: checkout repo 
+        uses: actions/checkout@v4
+      - uses: actions/setup-node@v4 
+        with:
+          node-version: 18
+
+      - name: Saving Cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+
+      - name: install dependencies
+        run: npm install 
+      - name: Run code coverage
+        continue-on-error: true
+        run: npm run coverage
+      - name: saving coverage artifact 
+        uses: actions/upload-artifact@v4
+        with: 
+          name: Coverage results
+          path: coverage
+          retention-days: 2
+
+
+  docker: 
+    name: containerization 
+    needs: [unit-testing, code-coverage]
+    runs-on: ubuntu-latest
+    steps: 
+      - name: checking out
+        uses: actions/checkout@v4
+      - name: docker login 
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+        
+      - name: Build and Push 
+        uses: docker/build-push-action@v6
+        with: 
+          context: .
+          tags:  ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+          push: false
+
+      - name: Testing Docker image
+        run: |  
+              docker images
+              docker run  --name mayank-solar-system  -d  \
+              -p 3000:3000 \
+              -e MONGO_URI=$MONGO_URI \
+              -e MONGO_USERNAME=$MONGO_USERNAME \
+              -e MONGO_PASSWORD=$MONGO_PASSWORD \
+              ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+
+              wget  -q -O - 127.0.0.1:3000/live  | grep -i live  
+
+      - name: Pushing image
+        uses: docker/build-push-action@v6
+        with: 
+          context: .
+          tags:  ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+          push: true
+
+
+  dev_deploy: 
+    if: contains(github.ref, 'feature/')
+    needs: docker
+    outputs: 
+      PORT: ${{ steps.myservice.outputs.PORT}}
+    environment: 
+      name: development
+      url: http://3.136.148.224:${{ steps.myservice.outputs.PORT}}
+    runs-on: ubuntu-latest
+    steps: 
+      - name: checkout repo 
+        uses: actions/checkout@v4
+
+      - name: using kubectl action 
+        uses:  azure/setup-kubectl@v4
+        with:
+          version: 'v1.30.0'
+
+      - name: login using kubeconfieg files 
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: "${{ secrets.KUBECONFIG }}"
+          context: kubernetes-admin@kubernetes
+
+      - name: runnnig kubectl commands
+        run: |
+              kubectl version 
+              kubectl get nodes  
+
+      - name: replaceing some token 
+        uses: cschleiden/replace-tokens@v1
+        with: 
+          tokenPrefix: '_{_'
+          tokenSuffix: '_}_'
+          files: '["kubernetes/development/*.yaml"]'
+        env:
+          NAMESPACE: ${{ vars.NAMESPACE }}
+          REPLICAS: ${{ vars.REPLICAS }}
+          IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha}}
+
+      - name: printing yaml 
+        run: | 
+               cat kubernetes/development/*.yaml
+
+      - name: Creating A secret becuase pod needs it 
+        continue-on-error: true
+        run: | 
+          kubectl -n ${{ vars.NAMESPACE }} create secret generic mongo-db-creds \
+          --from-literal=MONGO_URI=${{ env.MONGO_URI }} \
+          --from-literal=MONGO_USERNAME=${{ vars.MONGO_USERNAME }} \
+          --from-literal=MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }} 
+
+      - name: Deploying app 
+        run: |
+          kubectl apply -f kubernetes/development/
+    
+      - name: retriving the url of service with nodeport
+        id: myservice
+        run: | 
+          echo "PORT=$(kubectl get svc  solar-system -n development  -o jsonpath='{.spec.ports[0].nodePort}')"  >> $GITHUB_OUTPUT
+
+  integration-testing:
+    if: contains(github.ref, 'feature/')
+    name: Dev Integration Testing
+    needs: dev_deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test URL Mayank
+        env:
+          MAYANK: ${{ needs.dev_deploy.outputs.PORT }}
+        run: | 
+          curl  http://3.136.148.224:$MAYANK/live  -s -k  | grep -i live 
+
+
+  prod_deploy: 
+    if:  github.ref ==  'refs/heads/main'
+    needs: docker
+    outputs: 
+      PORTA: ${{ steps.myservice.outputs.PORT}}
+    environment: 
+      name: production 
+      url: http://3.136.148.224:${{ steps.myservice.outputs.PORT}}
+    runs-on: ubuntu-latest
+    steps: 
+      - name: checkout repo 
+        uses: actions/checkout@v4
+
+      - name: using kubectl action 
+        uses:  azure/setup-kubectl@v4
+        with:
+          version: 'v1.30.0'
+
+      - name: login using kubeconfieg files 
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: "${{ secrets.KUBECONFIG }}"
+          context: kubernetes-admin@kubernetes
+
+      - name: runnnig kubectl commands
+        run: |
+              kubectl version 
+              kubectl get nodes  
+
+      - name: replaceing some token 
+        uses: cschleiden/replace-tokens@v1
+        with: 
+          tokenPrefix: '_{_'
+          tokenSuffix: '_}_'
+          files: '["kubernetes/production/*.yaml"]'
+        env:
+          NAMESPACE: ${{ vars.NAMESPACE }}
+          REPLICAS: ${{ vars.REPLICAS }}
+          IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha}}
+
+      - name: printing yaml 
+        run: | 
+               cat kubernetes/production/*.yaml
+
+      - name: Creating A secret becuase pod needs it 
+        continue-on-error: true
+        run: | 
+          kubectl -n ${{ vars.NAMESPACE }} create secret generic mongo-db-creds \
+          --from-literal=MONGO_URI=${{ env.MONGO_URI }} \
+          --from-literal=MONGO_USERNAME=${{ vars.MONGO_USERNAME }} \
+          --from-literal=MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }} 
+
+      - name: Deploying app 
+        run: |
+          kubectl apply -f kubernetes/production/
+    
+      - name: retriving the url of service with nodeport
+        id: myservice
+        run: | 
+          echo "PORTA=$(kubectl get svc  solar-system -n prod  -o jsonpath='{.spec.ports[0].nodePort}')"  >> $GITHUB_OUTPUT
+
+  prod-integration-testing:
+    if:  github.ref ==  'refs/heads/main'
+    name: Prod Integration Testing
+    needs: prod_deploy 
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test URL Mayank
+        env:
+          MAYANKA: ${{ needs.prod_deploy.outputs.PORTA }}
+        run: | 
+          curl  http://3.136.148.224:$MAYANKA/live  -s -k  | grep -i live
