@@ -1,0 +1,84 @@
+name: Resuable Deployment Yaml files
+on: 
+  workflow_call: 
+    inputs: 
+      mongo-uri: 
+        type: string
+        required: true
+      environment: 
+        required: true
+        type: string
+        default: development
+      k8s-manifest-dir: 
+        required: true
+        default: kubernetes/
+        type: string 
+    secrets: 
+      k8s-kubeconfig: 
+        required: true
+      mongo-pass:
+        required: true
+    outputs: 
+      application-url: 
+        value:  ${{ jobs.reuse-dep.outputs.PORT }}
+
+jobs: 
+  reuse-dep: 
+    outputs: 
+      PORT: ${{ steps.myservice.outputs.PORT }}
+    environment: 
+      name: ${{ inputs.environment }}
+      url: http://3.136.148.224:${{ steps.myservice.outputs.PORT}}
+    runs-on: ubuntu-latest
+    steps: 
+      - name: checkout repo 
+        uses: actions/checkout@v4
+
+      - name: using kubectl action 
+        uses:  azure/setup-kubectl@v4
+        with:
+          version: 'v1.30.0'
+
+      - name: login using kubeconfieg files 
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: "${{ secrets.k8s-kubeconfig }}"
+          context: kubernetes-admin@kubernetes
+
+      - name: runnnig kubectl commands
+        run: |
+              kubectl version 
+              kubectl get nodes  
+
+      - name: replaceing some token 
+        uses: cschleiden/replace-tokens@v1
+        with: 
+          tokenPrefix: '_{_'
+          tokenSuffix: '_}_'
+          files: '["${{ inputs.k8s-manifest-dir }}*.yaml"]'
+        env:
+          NAMESPACE: ${{ vars.NAMESPACE }}
+          REPLICAS: ${{ vars.REPLICAS }}
+          IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha}}
+
+      - name: printing yaml 
+        run: | 
+               cat ${{ inputs.k8s-manifest-dir }}*.yaml
+
+      - name: Creating A secret becuase pod needs it 
+        continue-on-error: true
+        run: | 
+          kubectl -n ${{ vars.NAMESPACE }} create secret generic mongo-db-creds \
+          --from-literal=MONGO_URI=${{ vars.MONGO_URI }} \
+          --from-literal=MONGO_USERNAME=${{ vars.MONGO_USERNAME }} \
+          --from-literal=MONGO_PASSWORD=${{ secrets.mongo-pass }} 
+
+      - name: Deploying app 
+        run: |
+          kubectl apply -f  ${{ inputs.k8s-manifest-dir }}
+    
+      - name: retriving the url of service with nodeport
+        id: myservice
+        run: | 
+          echo "PORT=$(kubectl get svc  solar-system -n development  -o jsonpath='{.spec.ports[0].nodePort}')"  >> $GITHUB_OUTPUT
